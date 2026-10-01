@@ -82,7 +82,7 @@ ECR: two repositories — `final-project-visits-service`, `final-project-stats-s
 - **Route:** `GET /stats` — calls `visits-service` internally and returns a combined result
 - **Required environment variables:** `VISITS_SERVICE_URL` (e.g. `http://<visits-service-private-ip>:8080` — its private IP, not the ALB), `ALLOWED_ORIGIN` (same CloudFront domain)
 - **IAM on its instance role:** same as `visits-service`
-- **Security group:** inbound 8081 from the ALB's SG only; **outbound** to `visits-service`'s SG on 8080 (this is the one place in the whole project where a security group rule exists purely for service-to-service traffic, not client-to-server)
+- **Security group:** inbound 8081 from the ALB's SG only. It also calls `visits-service` on 8080 — but leave outbound at its default (allow-all) rather than trying to scope it down. Restricting egress to just `visits-service`'s SG sounds like the "more secure" move, but it silently breaks SSM and `docker pull` from ECR too, since both need outbound 443 to AWS's API endpoints — the default allow-all already covers the internal call to `visits-service`, so there's nothing to gain by narrowing it here.
 
 ### `workloads/frontend/`
 - **Deploys to:** S3 (static hosting, bucket **not** public — access only via CloudFront using Origin Access Control) + CloudFront in front of it
