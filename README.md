@@ -96,6 +96,16 @@ ECR: two repositories — `final-project-visits-service`, `final-project-stats-s
 
 ---
 
+## Known Issues (Seen Live)
+
+⚠️ **RDS rejects the connection with `no pg_hba.conf entry for host "...", no encryption`.** RDS PostgreSQL requires SSL by default — `psycopg2.connect()` doesn't enable it automatically just because you passed a password. You don't need to touch `app.py`: psycopg2 (via libpq) reads the standard `PGSSLMODE` environment variable, so adding `-e PGSSLMODE=require` to the `docker run` command is enough. If you see a *different* error afterward (`password authentication failed`) instead of this one, that's not this issue — see the next item.
+
+⚠️ **Don't pass the DB password as a literal value in your SSM deploy command.** It's tempting to build the `docker run ... -e DB_PASSWORD=<value> ...` string directly inside your `ssm send-command` call — but that embeds the plaintext password in SSM's command history and CloudTrail, permanently, regardless of how it's protected everywhere else. Store the password in **SSM Parameter Store** as a `SecureString` instead (`aws ssm put-parameter --type SecureString`), grant the EC2 instance role `ssm:GetParameter` on that one parameter ARN, and have the *deploy script itself* fetch the password at runtime (`aws ssm get-parameter --with-decryption`) — so the command sent from outside only ever contains the retrieval logic, never the secret value.
+
+⚠️ **If you ever reset or recreate the RDS instance, every cached copy of the old password is now wrong.** Easy to hit if you tear down and rebuild RDS mid-project (common while debugging) but still have the old password saved somewhere (a local file, a stale Parameter Store value) — `visits-service` will crash-loop with `password authentication failed`, which looks identical to a typo but isn't. If this happens, don't hunt for where the old value is cached — it's simpler to generate a **fresh** password with `aws rds modify-db-instance --master-user-password <new> --apply-immediately`, update the Parameter Store value to match, and redeploy. That guarantees exactly one source of truth instead of chasing down every place the old one might still be sitting.
+
+---
+
 ## What We Expect From the CI/CD Pipeline
 
 Build this as a GitHub Actions workflow (`.github/workflows/deploy.yml`), following the same OIDC pattern from Lesson 5 — **no AWS access keys stored in GitHub at any point**.
