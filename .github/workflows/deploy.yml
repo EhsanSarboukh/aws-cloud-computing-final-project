@@ -1,0 +1,155 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write      # required for OIDC
+  contents: read
+
+env:
+  AWS_REGION: eu-north-1
+  ACCOUNT_ID: "233291747495"
+  VISITS_INSTANCE: i-0ce3f0a698a982359
+  STATS_INSTANCE: i-021997bb27c168cb4
+  VISITS_IP: 10.0.129.254
+  ALB_DNS: final-project-alb-948623371.eu-north-1.elb.amazonaws.com
+  CF_DOMAIN: d1s3rhqnkif1og.cloudfront.net
+  CF_DIST_ID: E6IMIKWMFA0QM
+  S3_BUCKET: final-project-frontend-233291747495
+  DB_HOST: final-project-db.c3mee8eqkx0r.eu-north-1.rds.amazonaws.com
+
+jobs:
+  # ----------------------------------------------------------------
+  # Detect which workloads changed on this push
+  # ----------------------------------------------------------------
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      visits: ${{ steps.filter.outputs.visits }}
+      stats: ${{ steps.filter.outputs.stats }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            visits:
+              - 'workloads/visits-service/**'
+            stats:
+              - 'workloads/stats-service/**'
+            frontend:
+              - 'workloads/frontend/**'
+
+  # ----------------------------------------------------------------
+  # visits-service: build -> ECR -> SSM deploy
+  # ----------------------------------------------------------------
+  deploy-visits:
+    needs: changes
+    if: needs.changes.outputs.visits == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        run: |
+          IMAGE=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/final-project-visits-service:latest
+          docker build -t $IMAGE workloads/visits-service
+          docker push $IMAGE
+      - name: Deploy via SSM
+        run: |
+          cat > deploy.sh <<'EOF'
+          set -e
+          REGION=eu-north-1
+          ACCOUNT=233291747495
+          REGISTRY=$ACCOUNT.dkr.ecr.$REGION.amazonaws.com
+          IMAGE=$REGISTRY/final-project-visits-service:latest
+          aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REGISTRY
+          docker pull $IMAGE
+          DB_PASSWORD=$(aws ssm get-parameter --name /final-project/db-password --with-decryption --region $REGION --query 'Parameter.Value' --output text)
+          docker rm -f visits-service 2>/dev/null || true
+          docker run -d --restart always --name visits-service -p 8080:8080 \
+            -e DB_HOST=DBHOST -e DB_NAME=visitsdb -e DB_USER=dbadmin \
+            -e DB_PASSWORD="$DB_PASSWORD" -e PGSSLMODE=require \
+            -e ALLOWED_ORIGIN=http://CFDOMAIN \
+            $IMAGE
+          EOF
+          sed -i "s|DBHOST|$DB_HOST|; s|CFDOMAIN|$CF_DOMAIN|" deploy.sh
+          python3 -c "import json;json.dump({'commands':[open('deploy.sh').read()]},open('params.json','w'))"
+          CMD=$(aws ssm send-command --instance-ids $VISITS_INSTANCE \
+            --document-name AWS-RunShellScript --parameters file://params.json \
+            --query 'Command.CommandId' --output text)
+          echo "SSM command: $CMD"
+          sleep 25
+          aws ssm get-command-invocation --command-id $CMD --instance-id $VISITS_INSTANCE \
+            --query 'Status' --output text
+
+  # ----------------------------------------------------------------
+  # stats-service: build -> ECR -> SSM deploy
+  # ----------------------------------------------------------------
+  deploy-stats:
+    needs: changes
+    if: needs.changes.outputs.stats == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        run: |
+          IMAGE=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/final-project-stats-service:latest
+          docker build -t $IMAGE workloads/stats-service
+          docker push $IMAGE
+      - name: Deploy via SSM
+        run: |
+          cat > deploy.sh <<'EOF'
+          set -e
+          REGION=eu-north-1
+          ACCOUNT=233291747495
+          REGISTRY=$ACCOUNT.dkr.ecr.$REGION.amazonaws.com
+          IMAGE=$REGISTRY/final-project-stats-service:latest
+          aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $REGISTRY
+          docker pull $IMAGE
+          docker rm -f stats-service 2>/dev/null || true
+          docker run -d --restart always --name stats-service -p 8081:8081 \
+            -e VISITS_SERVICE_URL=http://VISITSIP:8080 \
+            -e ALLOWED_ORIGIN=http://CFDOMAIN \
+            $IMAGE
+          EOF
+          sed -i "s|VISITSIP|$VISITS_IP|; s|CFDOMAIN|$CF_DOMAIN|" deploy.sh
+          python3 -c "import json;json.dump({'commands':[open('deploy.sh').read()]},open('params.json','w'))"
+          CMD=$(aws ssm send-command --instance-ids $STATS_INSTANCE \
+            --document-name AWS-RunShellScript --parameters file://params.json \
+            --query 'Command.CommandId' --output text)
+          echo "SSM command: $CMD"
+          sleep 25
+          aws ssm get-command-invocation --command-id $CMD --instance-id $STATS_INSTANCE \
+            --query 'Status' --output text
+
+  # ----------------------------------------------------------------
+  # frontend: sed ALB DNS -> S3 sync -> CloudFront invalidation
+  # ----------------------------------------------------------------
+  deploy-frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Inject ALB DNS and deploy
+        run: |
+          sed -i "s|__API_BASE_URL__|http://$ALB_DNS|" workloads/frontend/index.html
+          aws s3 cp workloads/frontend/index.html s3://$S3_BUCKET/index.html --content-type text/html
+          aws cloudfront create-invalidation --distribution-id $CF_DIST_ID --paths "/*"
